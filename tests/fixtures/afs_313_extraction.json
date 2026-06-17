@@ -1,0 +1,39 @@
+{
+  "unit_number": {
+    "occurrences": [
+      {"location": "Page 1, Preamble", "raw_text": "Unit No. 313", "value": "313"},
+      {"location": "Page 3, Schedule A", "raw_text": "Flat No. 313", "value": "313"}
+    ],
+    "distinct_values": ["313"],
+    "internal_status": "INTERNAL_OK"
+  },
+  "agreement_value": {
+    "occurrences": [
+      {"location": "Page 2, Clause 3", "raw_text": "Rs. 99,77,517/-", "value": "9977517"},
+      {"location": "Page 5, Clause 12", "raw_text": "Rs.99,77,517/-", "value": "9977517"}
+    ],
+    "distinct_values": ["9977517"],
+    "internal_status": "INTERNAL_OK",
+    "figure_vs_words": "OK"
+  },
+  "area_sqm": {
+    "occurrences": [
+      {"location": "Page 1, Schedule A", "raw_text": "42.06 Sq. Mt.", "value": "42.06"}
+    ],
+    "distinct_values": ["42.06"],
+    "internal_status": "INTERNAL_OK"
+  },
+  "area_sqft": {
+    "occurrences": [
+      {"location": "Page 1, Schedule A", "raw_text": "453 Sq. Ft.", "value": "453"}
+    ],
+    "distinct_values": ["453"],
+    "internal_status": "INTERNAL_OK"
+  },
+  "extraction_confidence": "HIGH",
+  "afs_meta": {
+    "buyer_name": "Test Buyer",
+    "project_name": "AFS 02 313",
+    "afs_date": "15/04/2026"
+  }
+}

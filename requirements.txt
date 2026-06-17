@@ -8,4 +8,7 @@ markitdown[pdf]
 fpdf2
 pandas
 markdown
+gspread
+google-auth
+pytest
 

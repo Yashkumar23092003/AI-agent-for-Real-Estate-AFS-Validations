@@ -592,3 +592,172 @@ def generate_pdf_report(
     pdf.output(buf)
     buf.seek(0)
     return buf.getvalue()
+
+
+# ── Sheet audit PDF ───────────────────────────────────────────────────────────
+
+def generate_sheet_audit_pdf(result: dict) -> bytes:
+    """
+    Generates a branded PDF for an AFS ↔ Sheet audit result.
+
+    'result' is the dict returned by agent.verify_afs_against_sheet().
+    """
+    afs_meta = result.get("afs_meta", {})
+    verdict = result.get("verdict", "FAIL")
+    fields = result.get("fields", [])
+    warnings = result.get("warnings", [])
+    schema_caveats = result.get("schema_caveats", [])
+    extraction = result.get("extraction", {})
+
+    unit_no = (
+        extraction.get("unit_number", {}).get("distinct_values", [""])[0]
+        if extraction else ""
+    )
+
+    # Build a json_data shape compatible with _draw_cover
+    cover_data = {
+        "buyer_name": afs_meta.get("buyer_name", ""),
+        "project_name": afs_meta.get("project_name", ""),
+        "unit_number": unit_no,
+        "afs_date": afs_meta.get("afs_date", ""),
+        "status": "MATCH" if verdict == "PASS" else "MISMATCH",
+    }
+
+    pdf = KYCReportPDF(json_data=cover_data)
+    pdf.alias_nb_pages()
+
+    _draw_cover(pdf, afs_meta.get("buyer_name", ""), cover_data)
+
+    # ── Results page ──
+    pdf.add_page()
+    pdf.set_left_margin(12)
+    pdf.set_right_margin(12)
+
+    # Section heading
+    y_now = pdf.get_y()
+    pdf.set_fill_color(*SECTION_BG)
+    pdf.rect(10, y_now, 190, 10, "F")
+    pdf.set_fill_color(*BLUE)
+    pdf.rect(10, y_now, 4, 10, "F")
+    pdf.set_xy(17, y_now)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(183, 10, _clean("AFS vs Google Sheet - Field Verification"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Verdict banner
+    v_bg = MATCH_BG if verdict == "PASS" else MISMATCH_BG
+    v_fg = MATCH_FG if verdict == "PASS" else MISMATCH_FG
+    v_txt = "PASS - ALL FIELDS VERIFIED" if verdict == "PASS" else "FAIL - MISMATCH DETECTED"
+    bx, by = pdf.get_x(), pdf.get_y()
+    pdf.set_fill_color(*v_bg)
+    pdf.set_draw_color(*v_fg)
+    pdf.set_line_width(0.6)
+    pdf.rect(bx, by, 186, 12, "FD")
+    pdf.set_fill_color(*v_fg)
+    pdf.rect(bx, by, 4, 12, "F")
+    pdf.set_line_width(0.2)
+    pdf.set_xy(bx + 8, by)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*v_fg)
+    pdf.cell(178, 12, _clean(v_txt), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    pdf.set_draw_color(*RULE_CLR)
+
+    # Field table
+    # Columns: Status | Field | AFS Raw | Sheet Raw | AFS Norm | Sheet Norm | Detail
+    col_w = [20, 28, 38, 28, 22, 22, 50]
+    headers = ["Status", "Field", "AFS Raw Value(s)", "Sheet Raw", "AFS Norm.", "Sheet Norm.", "Notes"]
+    line_h = 5.5
+    page_w = sum(col_w)
+
+    # Header row
+    x0, y0 = pdf.get_x(), pdf.get_y()
+    pdf.set_fill_color(*HEADER_BG)
+    pdf.rect(x0, y0, page_w, line_h + 2, "F")
+    pdf.set_text_color(*WHITE)
+    pdf.set_font("Helvetica", "B", 6.5)
+    for j, (hdr, cw) in enumerate(zip(headers, col_w)):
+        pdf.set_xy(x0 + sum(col_w[:j]), y0)
+        pdf.cell(cw, line_h + 2, hdr, border=0, align="C", new_x="RIGHT", new_y="TOP")
+    pdf.set_y(y0 + line_h + 2)
+    pdf.set_draw_color(*RULE_CLR)
+
+    # Data rows
+    for row_idx, f in enumerate(fields):
+        # Coerce to dict (works for both FieldResult dataclass and plain dict)
+        if not isinstance(f, dict):
+            fd = {
+                "field_name": f.field_name, "status": f.status,
+                "afs_occurrences": f.afs_occurrences,
+                "afs_distinct_values": f.afs_distinct_values,
+                "sheet_raw": f.sheet_raw, "afs_normalized": f.afs_normalized,
+                "sheet_normalized": f.sheet_normalized, "detail": f.detail,
+            }
+        else:
+            fd = f
+
+        status_lbl = fd.get("status", "")
+        raw_afs = "; ".join(
+            f"{o.get('location','')}: {o.get('raw_text','')}"
+            for o in fd.get("afs_occurrences", [])
+        ) or " | ".join(str(v) for v in fd.get("afs_distinct_values", []))
+
+        cells = [
+            status_lbl,
+            fd.get("field_name", ""),
+            raw_afs,
+            str(fd.get("sheet_raw", "")),
+            str(fd.get("afs_normalized") or "—"),
+            str(fd.get("sheet_normalized") or "—"),
+            _clean(str(fd.get("detail") or "")),
+        ]
+
+        # Estimate row height
+        max_lines = 1
+        for j, ct in enumerate(cells):
+            avg_w = pdf.get_string_width("A") or 1.8
+            chars = max(1, int(col_w[j] / avg_w))
+            max_lines = max(max_lines, max(1, -(-len(_clean(ct)) // chars)))
+        row_h = line_h * max_lines
+
+        if pdf.get_y() + row_h > 272:
+            pdf.add_page()
+
+        x0, y0 = pdf.get_x(), pdf.get_y()
+        fill = LIGHT_BG if row_idx % 2 == 0 else WHITE
+        pdf.set_fill_color(*fill)
+        pdf.set_draw_color(*RULE_CLR)
+        pdf.rect(x0, y0, page_w, row_h, "FD")
+
+        for j, (ct, cw) in enumerate(zip(cells, col_w)):
+            pdf.set_xy(x0 + sum(col_w[:j]), y0)
+            if j == 0:
+                _status_badge(pdf, ct, cw, row_h)
+            else:
+                pdf.set_font("Helvetica", "", 6.5)
+                pdf.set_text_color(*DARK_TXT)
+                pdf.multi_cell(cw, line_h, _clean(ct), border=0, fill=False,
+                               new_x="RIGHT", new_y="TOP", max_line_height=line_h)
+            if j < len(col_w) - 1:
+                sep_x = x0 + sum(col_w[:j + 1])
+                pdf.set_draw_color(*RULE_CLR)
+                pdf.line(sep_x, y0, sep_x, y0 + row_h)
+
+        pdf.set_y(y0 + row_h)
+
+    # Warnings & caveats
+    all_notes = warnings + schema_caveats
+    if all_notes:
+        pdf.ln(5)
+        for note in all_notes:
+            pdf.set_x(12)
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.set_text_color(*GREY_TXT)
+            pdf.multi_cell(186, 5, f"[NOTE] {_clean(note)}", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+
+    buf = io.BytesIO()
+    pdf.output(buf)
+    buf.seek(0)
+    return buf.getvalue()

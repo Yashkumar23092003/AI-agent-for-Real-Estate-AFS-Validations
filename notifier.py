@@ -257,7 +257,7 @@ KYC Verification Agent
 
 def generate_mismatch_email(crm_email, buyer_name, project_name, unit_number, afs_date, mismatches_text, report_text=""):
     subject = f"❌ KYC MISMATCH — ACTION REQUIRED | {buyer_name} | {project_name} | {unit_number}"
-    
+
     plain_body = f"""Dear CRM Team,
 
 ⚠️ URGENT — KYC VERIFICATION FAILED
@@ -283,5 +283,124 @@ KYC Verification Agent
         html_body = build_html_report_email(buyer_name, project_name, unit_number, afs_date, "MISMATCH", report_text)
     else:
         html_body = f"<p>Mismatches detected for client <strong>{buyer_name}</strong>: {mismatches_text}</p>"
-        
+
+    return send_verification_email(crm_email, subject, html_body, plain_body)
+
+
+# ── AFS ↔ Sheet audit email ───────────────────────────────────────────────────
+
+def _build_sheet_audit_html(buyer_name, unit_no, project_name, verdict, fields, warnings):
+    """Builds a styled HTML email body for a sheet audit result."""
+    if verdict == "PASS":
+        status_color, status_bg, status_border = "#10b981", "#ecfdf5", "#a7f3d0"
+        status_text = "✅ ALL FIELDS VERIFIED — PASS"
+    else:
+        status_color, status_bg, status_border = "#ef4444", "#fef2f2", "#fca5a5"
+        status_text = "❌ VERIFICATION FAILED — MISMATCH DETECTED"
+
+    rows_html = ""
+    for f in fields:
+        if f["status"] == "MATCH":
+            badge = '<span style="background:#d1fae5;color:#065f46;padding:3px 8px;border-radius:9999px;font-size:11px;font-weight:600;">✅ MATCH</span>'
+        elif f["status"] == "SCHEMA_CAVEAT":
+            badge = '<span style="background:#fef3c7;color:#92400e;padding:3px 8px;border-radius:9999px;font-size:11px;font-weight:600;">⚠️ CAVEAT</span>'
+        else:
+            badge = f'<span style="background:#fee2e2;color:#991b1b;padding:3px 8px;border-radius:9999px;font-size:11px;font-weight:600;">❌ {f["status"]}</span>'
+
+        afs_val = f.get("afs_normalized") or " | ".join(str(v) for v in f.get("afs_distinct_values", []))
+        sheet_val = f.get("sheet_normalized") or f.get("sheet_raw") or "—"
+        detail = f.get("detail") or ""
+
+        rows_html += f"""
+        <tr>
+          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;">{badge}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-weight:600;">{f["field_name"]}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;">{afs_val}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;">{sheet_val}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#64748b;">{detail}</td>
+        </tr>"""
+
+    warnings_html = ""
+    if warnings:
+        items = "".join(f"<li>{w}</li>" for w in warnings)
+        warnings_html = f'<p style="color:#92400e;background:#fef3c7;padding:12px;border-radius:6px;font-size:13px;"><strong>⚠️ Warnings:</strong><ul>{items}</ul></p>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>AFS Sheet Audit</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#334155;background:#f8fafc;margin:0;padding:20px;">
+  <div style="max-width:800px;margin:0 auto;background:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.08);border:1px solid #e2e8f0;overflow:hidden;">
+    <div style="background:linear-gradient(135deg,#1e293b,#0f172a);color:#fff;padding:24px;text-align:center;">
+      <h1 style="margin:0;font-size:20px;font-weight:700;">AFS ↔ Google Sheet Audit</h1>
+    </div>
+    <div style="padding:24px;">
+      <div style="padding:14px;border-radius:8px;margin-bottom:20px;font-weight:700;font-size:15px;text-align:center;
+                  background-color:{status_bg};color:{status_color};border:1px solid {status_border};">
+        {status_text}
+      </div>
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:20px;font-size:14px;">
+        <strong>Buyer:</strong> {buyer_name} &nbsp;|&nbsp;
+        <strong>Unit No.:</strong> {unit_no} &nbsp;|&nbsp;
+        <strong>Project:</strong> {project_name}
+      </div>
+      {warnings_html}
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="background:#f1f5f9;">
+            <th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;">Status</th>
+            <th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;">Field</th>
+            <th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;">AFS Value</th>
+            <th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;">Sheet Value</th>
+            <th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;">Notes</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <div style="background:#f8fafc;padding:14px;text-align:center;font-size:11px;color:#64748b;border-top:1px solid #e2e8f0;">
+      Auto-generated by KYC Verification Agent. Do not reply to this email.
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def generate_sheet_audit_email(crm_email, buyer_name, unit_no, project_name,
+                                verdict, fields, warnings):
+    """
+    Sends a sheet audit result email (both PASS and FAIL).
+    'fields' must be a list of dicts (from database.save_sheet_audit serialisation
+    or from FieldResult.__dict__).
+    """
+    verdict_label = "PASS ✅" if verdict == "PASS" else "FAIL ❌"
+    subject = f"AFS Sheet Audit {verdict_label} — Unit {unit_no} | {project_name}"
+
+    plain_body = (
+        f"AFS ↔ Sheet Verification Result\n\n"
+        f"Buyer:   {buyer_name}\n"
+        f"Unit:    {unit_no}\n"
+        f"Project: {project_name}\n"
+        f"Verdict: {verdict}\n\n"
+        "Please view this email in an HTML-capable client for the full field table.\n\n"
+        "Regards,\nKYC Verification Agent"
+    )
+
+    # Normalise fields to dicts (accept both dataclass instances and plain dicts)
+    fields_dicts = []
+    for f in fields:
+        if isinstance(f, dict):
+            fields_dicts.append(f)
+        else:
+            fields_dicts.append({
+                "field_name": f.field_name,
+                "status": f.status,
+                "afs_distinct_values": f.afs_distinct_values,
+                "sheet_raw": f.sheet_raw,
+                "afs_normalized": f.afs_normalized,
+                "sheet_normalized": f.sheet_normalized,
+                "detail": f.detail,
+            })
+
+    html_body = _build_sheet_audit_html(buyer_name, unit_no, project_name,
+                                         verdict, fields_dicts, warnings)
     return send_verification_email(crm_email, subject, html_body, plain_body)
