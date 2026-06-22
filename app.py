@@ -8,7 +8,7 @@ from database import (
     save_sheet_audit, get_all_sheet_audits_df, get_sheet_audit_by_id,
 )
 from pdf_report import generate_pdf_report, generate_sheet_audit_pdf
-from comparator import MATCH, MISMATCH, SCHEMA_CAVEAT, INTERNAL_DISCREPANCY, NOT_FOUND_IN_AFS, NOT_FOUND_IN_SHEET
+from comparator import MATCH, MISMATCH, SCHEMA_CAVEAT, INTERNAL_DISCREPANCY, NOT_FOUND_IN_AFS, NOT_FOUND_IN_SHEET, INFO_ONLY
 
 
 # ── Shared result renderers (used by both individual tabs and the unified tab) ──
@@ -102,6 +102,7 @@ def render_sheet_result(result, sheet_id, tab_name, afs_filename, crm_email, key
         INTERNAL_DISCREPANCY: "🔴 INTERNAL DISCREPANCY",
         NOT_FOUND_IN_AFS: "❓ NOT IN AFS",
         NOT_FOUND_IN_SHEET: "❓ NOT IN SHEET",
+        INFO_ONLY: "ℹ️ INFO ONLY",
     }
 
     rows = []
@@ -129,6 +130,8 @@ def render_sheet_result(result, sheet_id, tab_name, afs_filename, crm_email, key
             return "background-color: #fee2e2; color: #991b1b;"
         if "CAVEAT" in val or "NOT IN" in val:
             return "background-color: #fef3c7; color: #92400e;"
+        if "INFO" in val:
+            return "background-color: #e0e7ff; color: #3730a3;"
         return ""
 
     styled = df_fields.style.map(_colour_status, subset=["Status"])
@@ -586,6 +589,7 @@ with tab3:
                     "MATCH": "✅ MATCH", "MISMATCH": "❌ MISMATCH",
                     "SCHEMA_CAVEAT": "⚠️ CAVEAT", "INTERNAL_DISCREPANCY": "🔴 DISCREPANCY",
                     "NOT_FOUND_IN_AFS": "❓ NOT IN AFS", "NOT_FOUND_IN_SHEET": "❓ NOT IN SHEET",
+                    "INFO_ONLY": "ℹ️ INFO ONLY",
                 }
                 rows_hist = []
                 for f in audit_fields:

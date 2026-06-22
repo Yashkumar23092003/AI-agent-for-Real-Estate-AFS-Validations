@@ -14,8 +14,9 @@ INTERNAL_DISCREPANCY = "INTERNAL_DISCREPANCY"
 NOT_FOUND_IN_AFS = "NOT_FOUND_IN_AFS"
 NOT_FOUND_IN_SHEET = "NOT_FOUND_IN_SHEET"
 SCHEMA_CAVEAT = "SCHEMA_CAVEAT"
+INFO_ONLY = "INFO_ONLY"  # extracted & displayed, but never affects the verdict
 
-PASS_STATUSES = {MATCH, SCHEMA_CAVEAT}
+PASS_STATUSES = {MATCH, SCHEMA_CAVEAT, INFO_ONLY}
 
 REQUIRED_CONTRACT_FIELDS = {"unit_number", "agreement_value", "area_sqm", "area_sqft"}
 
@@ -564,27 +565,32 @@ def _compare_simple_field(extraction: dict, sheet_row: dict, contract_key: str,
 
 
 # Non-core fields, in report display order. Each: (extraction contract key,
-# display name, EXACT normalized sheet header, normalizer). Sheet headers come
-# from the live "Inventory Sheet" tab (note quirks: 'legal charges (15k)',
-# 'parking conf. (stack /tendem)'). A field is compared only when the extraction
-# actually contains it, so 4-field extractions are unaffected.
+# display name, EXACT normalized sheet header, normalizer, info_only). Sheet
+# headers come from the live "Inventory Sheet" tab (note quirks:
+# 'legal charges (15k)', 'parking conf. (stack /tendem)'). A field is compared
+# only when the extraction actually contains it, so 4-field extractions are
+# unaffected. info_only=True fields are shown but never affect the verdict.
+#   - parking_level: sheet stores a code like 'BS-LVL-03', so digits are
+#     extracted from both sides (normalize_int) to match the AFS '3'.
+#   - legal_charges: sheet stores a payment status ('Paid'), not a figure,
+#     so it is info-only (cannot be a money match).
 _OPTIONAL_FIELD_SPECS = [
-    ("floor",              "Floor",                    "floor",                          normalize_text),
-    ("applicant_name",     "Applicant Name",           "applicants name",                normalize_text),
-    ("applicant_pan",      "Applicant PAN",            "applicant's pan no.",            normalize_pan),
-    ("applicant_email",    "Applicant Email",          "email id",                       normalize_email),
-    ("parking_no",         "Parking No.",              "parking no.",                    normalize_text),
-    ("parking_level",      "Parking Level (Basement)", "basement level",                 normalize_text),
-    ("parking_conf",       "Parking Configuration",    "parking conf. (stack /tendem)",  normalize_text),
-    ("parking_length",     "Parking Length (M)",       "parking length (m)",             normalize_dimension),
-    ("parking_width",      "Parking Width (M)",        "parking width (m)",              normalize_dimension),
-    ("parking_height",     "Parking Height (M)",       "parking height (m)",             normalize_dimension),
-    ("parking_total_area", "Parking Total Area (M)",   "parking total (m)",              normalize_dimension),
-    ("share_cert_no",      "Share Certificate No.",    "share certificate no.",          normalize_text),
-    ("share_from",         "Share Alloted From",       "share alloted from",             normalize_int),
-    ("share_to",           "Share Alloted",            "share alloted",                  normalize_int),
-    ("total_shares",       "Total No. of Shares",      "total no. of shares",            normalize_int),
-    ("legal_charges",      "Legal Charges",            "legal charges (15k)",            normalize_money),
+    ("floor",              "Floor",                    "floor",                          normalize_text,      False),
+    ("applicant_name",     "Applicant Name",           "applicants name",                normalize_text,      False),
+    ("applicant_pan",      "Applicant PAN",            "applicant's pan no.",            normalize_pan,       False),
+    ("applicant_email",    "Applicant Email",          "email id",                       normalize_email,     False),
+    ("parking_no",         "Parking No.",              "parking no.",                    normalize_text,      False),
+    ("parking_level",      "Parking Level (Basement)", "basement level",                 normalize_int,       False),
+    ("parking_conf",       "Parking Configuration",    "parking conf. (stack /tendem)",  normalize_text,      False),
+    ("parking_length",     "Parking Length (M)",       "parking length (m)",             normalize_dimension, False),
+    ("parking_width",      "Parking Width (M)",        "parking width (m)",              normalize_dimension, False),
+    ("parking_height",     "Parking Height (M)",       "parking height (m)",             normalize_dimension, False),
+    ("parking_total_area", "Parking Total Area (M)",   "parking total (m)",              normalize_dimension, False),
+    ("share_cert_no",      "Share Certificate No.",    "share certificate no.",          normalize_text,      False),
+    ("share_from",         "Share Alloted From",       "share alloted from",             normalize_int,       False),
+    ("share_to",           "Share Alloted",            "share alloted",                  normalize_int,       False),
+    ("total_shares",       "Total No. of Shares",      "total no. of shares",            normalize_int,       False),
+    ("legal_charges",      "Legal Charges",            "legal charges (15k)",            normalize_money,     True),
 ]
 
 
@@ -637,14 +643,26 @@ def run_comparison(extraction: dict, sheet_row: dict) -> ComparisonResult:
 
     # Append the remaining sheet-comparable fields, but only those the extraction
     # actually contains — so a core-only (4-field) extraction is unchanged.
-    for contract_key, display_name, sheet_header, normalizer in _OPTIONAL_FIELD_SPECS:
-        if contract_key in extraction:
-            fields.append(
-                _compare_simple_field(
-                    extraction, sheet_row, contract_key,
-                    display_name, sheet_header, normalizer,
-                )
+    for contract_key, display_name, sheet_header, normalizer, info_only in _OPTIONAL_FIELD_SPECS:
+        if contract_key not in extraction:
+            continue
+        fr = _compare_simple_field(
+            extraction, sheet_row, contract_key,
+            display_name, sheet_header, normalizer,
+        )
+        if info_only:
+            # Show the AFS value and sheet cell, but mark INFO_ONLY so the
+            # verdict is never affected (e.g. sheet stores a status, not a figure).
+            note = "Info only — does not affect verdict."
+            if fr.detail:
+                note += f" ({fr.detail})"
+            fr = FieldResult(
+                field_name=display_name, status=INFO_ONLY,
+                afs_occurrences=fr.afs_occurrences, afs_distinct_values=fr.afs_distinct_values,
+                sheet_raw=fr.sheet_raw, afs_normalized=fr.afs_normalized,
+                sheet_normalized=fr.sheet_normalized, detail=note,
             )
+        fields.append(fr)
 
     warnings = _sanity_check_area(sheet_row)
     schema_caveats = [f.detail for f in fields if f.status == SCHEMA_CAVEAT]
