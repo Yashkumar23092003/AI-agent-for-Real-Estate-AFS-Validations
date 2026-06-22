@@ -1,24 +1,43 @@
 """
 sheets.py — Google Sheets integration for AFS <-> Sheet verification.
-Reads data using a service account. No LLM, no comparison logic.
+Reads audited sheets and appends verification results to a log sheet,
+using a service account. No LLM, no comparison logic.
 """
 import os
+import json
+import datetime
 import gspread
 from google.oauth2 import service_account
 from comparator import normalize_header
 
+# Read-write on spreadsheets (needed to append log rows); read-only on Drive
+# (needed only to open sheets by key).
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 
 def _get_credentials() -> service_account.Credentials:
+    """
+    Loads service-account credentials from, in priority order:
+      1. GOOGLE_SHEETS_CREDENTIALS_JSON — the raw JSON key as a string
+         (use this on Streamlit Cloud, where there is no file on disk).
+      2. GOOGLE_SHEETS_CREDENTIALS_PATH — path to the JSON key file (local dev).
+    """
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    if creds_json:
+        info = json.loads(creds_json)
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+
     creds_path = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_PATH")
     if not creds_path:
         raise ValueError(
-            "GOOGLE_SHEETS_CREDENTIALS_PATH is not set in environment. "
-            "Set it to the path of your Google service account JSON file."
+            "No Google credentials found. Set GOOGLE_SHEETS_CREDENTIALS_JSON "
+            "(raw JSON, for Streamlit Cloud) or GOOGLE_SHEETS_CREDENTIALS_PATH "
+            "(file path, for local dev)."
         )
     if not os.path.isfile(creds_path):
         raise FileNotFoundError(
@@ -105,3 +124,80 @@ def find_unit_row(ws: gspread.Worksheet, unit_no: str) -> dict:
             result[norm_h] = raw_val
 
     return result
+
+
+# ── Log sheet (append-only audit trail) ───────────────────────────────────────
+
+# Canonical AFS field order — must match _OPTIONAL_FIELD_SPECS + the 4 core
+# fields in comparator.py, so AFS_Log columns line up run to run.
+AFS_FIELD_ORDER = [
+    "Unit Number", "Agreement Value", "Area (Sq.M)", "Area (Sq.Ft)",
+    "Floor", "Applicant Name", "Applicant PAN", "Applicant Email",
+    "Parking No.", "Parking Level (Basement)", "Parking Configuration",
+    "Parking Length (M)", "Parking Width (M)", "Parking Height (M)",
+    "Parking Total Area (M)", "Share Certificate No.", "Share Alloted From",
+    "Share Alloted", "Total No. of Shares", "Legal Charges",
+]
+
+KYC_LOG_HEADERS = [
+    "Timestamp", "Buyer Name", "Project Name", "Unit Number", "Status", "Report",
+]
+
+AFS_LOG_HEADERS = [
+    "Timestamp", "Unit No", "Buyer Name", "Project Name",
+    "Sheet ID", "Tab", "AFS Filename", "Verdict",
+] + AFS_FIELD_ORDER
+
+KYC_LOG_TAB = "KYC_Log"
+AFS_LOG_TAB = "AFS_Log"
+
+
+def _log_sheet_id() -> str:
+    sheet_id = os.environ.get("LOG_SHEET_ID")
+    if not sheet_id:
+        raise ValueError(
+            "LOG_SHEET_ID is not set. Create the log sheet, share it with the "
+            "service account as Editor, and put its ID in the environment."
+        )
+    return sheet_id
+
+
+def _get_or_create_tab(spreadsheet, tab: str, headers: list) -> gspread.Worksheet:
+    """Returns the tab, creating it with a header row if it doesn't exist."""
+    try:
+        return spreadsheet.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=tab, rows=1000, cols=len(headers))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
+
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_kyc_log(buyer_name, project_name, unit_number, status, report_text):
+    """Appends one row to the KYC_Log tab of the log sheet."""
+    gc = gspread.authorize(_get_credentials())
+    ss = gc.open_by_key(_log_sheet_id())
+    ws = _get_or_create_tab(ss, KYC_LOG_TAB, KYC_LOG_HEADERS)
+    row = [_now(), buyer_name, project_name, unit_number, status,
+           (report_text or "")[:45000]]  # cell hard limit is 50k chars
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def append_afs_log(unit_no, buyer_name, project_name, sheet_id, tab_name,
+                   verdict, fields, afs_filename):
+    """
+    Appends one row to the AFS_Log tab. `fields` is the list of FieldResult
+    objects; each field's status lands in its canonical column.
+    """
+    gc = gspread.authorize(_get_credentials())
+    ss = gc.open_by_key(_log_sheet_id())
+    ws = _get_or_create_tab(ss, AFS_LOG_TAB, AFS_LOG_HEADERS)
+
+    status_by_field = {f.field_name: f.status for f in fields}
+    field_cells = [status_by_field.get(name, "") for name in AFS_FIELD_ORDER]
+    row = [_now(), unit_no, buyer_name, project_name, sheet_id, tab_name,
+           afs_filename, verdict] + field_cells
+    ws.append_row(row, value_input_option="USER_ENTERED")

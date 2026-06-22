@@ -8,6 +8,7 @@ from database import (
     save_sheet_audit, get_all_sheet_audits_df, get_sheet_audit_by_id,
 )
 from pdf_report import generate_pdf_report, generate_sheet_audit_pdf
+from sheets import append_kyc_log, append_afs_log
 from comparator import MATCH, MISMATCH, SCHEMA_CAVEAT, INTERNAL_DISCREPANCY, NOT_FOUND_IN_AFS, NOT_FOUND_IN_SHEET, INFO_ONLY
 
 
@@ -24,6 +25,12 @@ def render_kyc_result(report_text, json_data, crm_email, key_prefix):
 
     save_verification(buyer_name, project_name, unit_number, status, report_text)
     st.toast("💾 KYC record saved to History!")
+
+    try:
+        append_kyc_log(buyer_name, project_name, unit_number, status, report_text)
+        st.toast("📊 Logged to Google Sheet!")
+    except Exception as e:
+        st.warning(f"⚠️ Could not log to Google Sheet: {e}")
 
     if status == "MATCH":
         st.info("✅ All KYC fields match. Triggering success email to CRM.")
@@ -204,6 +211,21 @@ def render_sheet_result(result, sheet_id, tab_name, afs_filename, crm_email, key
         afs_filename=afs_filename,
     )
     st.toast("💾 Audit record saved to History!")
+
+    try:
+        append_afs_log(
+            unit_no=unit_no,
+            buyer_name=buyer_name,
+            project_name=project_name,
+            sheet_id=sheet_id,
+            tab_name=tab_name,
+            verdict=verdict,
+            fields=fields,
+            afs_filename=afs_filename,
+        )
+        st.toast("📊 Logged to Google Sheet!")
+    except Exception as e:
+        st.warning(f"⚠️ Could not log to Google Sheet: {e}")
 
     # ── Email ────────────────────────────────────────────────────────
     email_ok = generate_sheet_audit_email(
