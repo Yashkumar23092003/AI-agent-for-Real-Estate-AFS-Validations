@@ -107,6 +107,69 @@ def normalize_unit_no(value: str) -> Optional[str]:
     return str(value).strip()
 
 
+def normalize_text(value: str) -> Optional[str]:
+    """
+    Case-insensitive text key: lowercase + collapse internal whitespace + strip.
+    Used for names, parking number/level/configuration, share certificate no., floor.
+    Returns None if empty. (Raw, original-case value is shown separately in the report.)
+    """
+    if value is None:
+        return None
+    v = re.sub(r'\s+', ' ', str(value)).strip().lower()
+    return v or None
+
+
+def normalize_pan(value: str) -> Optional[str]:
+    """Uppercase, strip all spaces and dashes. Returns None if empty."""
+    if value is None:
+        return None
+    v = re.sub(r'[\s\-]+', '', str(value)).upper()
+    return v or None
+
+
+def normalize_email(value: str) -> Optional[str]:
+    """Lowercase, strip all whitespace. Returns None if empty."""
+    if value is None:
+        return None
+    v = re.sub(r'\s+', '', str(value)).lower()
+    return v or None
+
+
+def normalize_dimension(value: str) -> Optional[Decimal]:
+    """
+    Parking dimensions: drop everything except digits and the decimal point
+    (strips 'm.', 'Up to', labels, spaces). Returns Decimal for exact compare.
+    '2.5 m.' -> 2.5 ; 'Up to 2.5 m. Height' -> 2.5 ; returns None if unparseable.
+    """
+    if value is None:
+        return None
+    v = re.sub(r'[^0-9.]', '', str(value))
+    if not v or v == '.':
+        return None
+    try:
+        return Decimal(v)
+    except InvalidOperation:
+        return None
+
+
+def normalize_int(value: str) -> Optional[int]:
+    """Extract digits only and parse as int. Used for share numbers/counts."""
+    if value is None:
+        return None
+    v = re.sub(r'[^0-9]', '', str(value))
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def _s(x) -> Optional[str]:
+    """str(x) but preserve None (for the normalized columns in FieldResult)."""
+    return str(x) if x is not None else None
+
+
 def _first_nonempty(val) -> str:
     """
     When a sheet column header appears multiple times (e.g. merged cells),
@@ -432,6 +495,99 @@ def _compare_area_sqft(extraction: dict, sheet_row: dict) -> FieldResult:
     )
 
 
+# ── Generic comparator for the remaining (non-core) sheet fields ─────────────
+
+def _compare_simple_field(extraction: dict, sheet_row: dict, contract_key: str,
+                          display_name: str, sheet_header: str, normalizer) -> FieldResult:
+    """
+    Single-occurrence, single-column comparison used for every field beyond the
+    four core ones. Reads the AFS value from extraction[contract_key], the sheet
+    value from sheet_row[sheet_header], normalizes both with `normalizer`, and
+    compares for exact equality. Mirrors the status logic of the core comparators.
+    """
+    fd = extraction.get(contract_key) or {}
+    occurrences = fd.get("occurrences", [])
+    distinct = fd.get("distinct_values", [])
+
+    if fd.get("internal_status") == "INTERNAL_DISCREPANCY":
+        return FieldResult(
+            field_name=display_name, status=INTERNAL_DISCREPANCY,
+            afs_occurrences=occurrences, afs_distinct_values=distinct,
+            sheet_raw="", afs_normalized=None, sheet_normalized=None,
+            detail=f"AFS contains conflicting values: {distinct}"
+        )
+
+    if not distinct:
+        return FieldResult(
+            field_name=display_name, status=NOT_FOUND_IN_AFS,
+            afs_occurrences=occurrences, afs_distinct_values=distinct,
+            sheet_raw="", afs_normalized=None, sheet_normalized=None,
+            detail=f"{display_name} not found in AFS"
+        )
+
+    afs_norm = normalizer(distinct[0])
+    sheet_raw_val = sheet_row.get(sheet_header, "")
+    sheet_raw = _first_nonempty(sheet_raw_val)
+    sheet_norm = normalizer(sheet_raw)
+    sheet_raw_display = str(sheet_raw_val)
+
+    if afs_norm is None:
+        return FieldResult(
+            field_name=display_name, status=NOT_FOUND_IN_AFS,
+            afs_occurrences=occurrences, afs_distinct_values=distinct,
+            sheet_raw=sheet_raw_display, afs_normalized=None,
+            sheet_normalized=_s(sheet_norm),
+            detail=f"AFS value '{distinct[0]}' could not be parsed"
+        )
+
+    if sheet_norm is None:
+        detail = (
+            f"'{sheet_header}' column not found in sheet"
+            if sheet_header not in sheet_row
+            else f"'{sheet_header}' cell is empty (raw: '{sheet_raw}')"
+        )
+        return FieldResult(
+            field_name=display_name, status=NOT_FOUND_IN_SHEET,
+            afs_occurrences=occurrences, afs_distinct_values=distinct,
+            sheet_raw=sheet_raw_display, afs_normalized=_s(afs_norm),
+            sheet_normalized=None, detail=detail
+        )
+
+    status = MATCH if afs_norm == sheet_norm else MISMATCH
+    detail = "" if status == MATCH else f"AFS: '{afs_norm}'  vs  Sheet: '{sheet_norm}'"
+    return FieldResult(
+        field_name=display_name, status=status,
+        afs_occurrences=occurrences, afs_distinct_values=distinct,
+        sheet_raw=sheet_raw_display, afs_normalized=_s(afs_norm),
+        sheet_normalized=_s(sheet_norm), detail=detail
+    )
+
+
+# Non-core fields, in report display order. Each: (extraction contract key,
+# display name, EXACT normalized sheet header, normalizer). Sheet headers come
+# from the live "Inventory Sheet" tab (note quirks: 'legal charges (15k)',
+# 'parking conf. (stack /tendem)'). A field is compared only when the extraction
+# actually contains it, so 4-field extractions are unaffected.
+_OPTIONAL_FIELD_SPECS = [
+    ("floor",              "Floor",                    "floor",                          normalize_text),
+    ("applicant_name",     "Applicant Name",           "applicants name",                normalize_text),
+    ("applicant_pan",      "Applicant PAN",            "applicant's pan no.",            normalize_pan),
+    ("applicant_email",    "Applicant Email",          "email id",                       normalize_email),
+    ("parking_no",         "Parking No.",              "parking no.",                    normalize_text),
+    ("parking_level",      "Parking Level (Basement)", "basement level",                 normalize_text),
+    ("parking_conf",       "Parking Configuration",    "parking conf. (stack /tendem)",  normalize_text),
+    ("parking_length",     "Parking Length (M)",       "parking length (m)",             normalize_dimension),
+    ("parking_width",      "Parking Width (M)",        "parking width (m)",              normalize_dimension),
+    ("parking_height",     "Parking Height (M)",       "parking height (m)",             normalize_dimension),
+    ("parking_total_area", "Parking Total Area (M)",   "parking total (m)",              normalize_dimension),
+    ("share_cert_no",      "Share Certificate No.",    "share certificate no.",          normalize_text),
+    ("share_from",         "Share Alloted From",       "share alloted from",             normalize_int),
+    ("share_to",           "Share Alloted",            "share alloted",                  normalize_int),
+    ("total_shares",       "Total No. of Shares",      "total no. of shares",            normalize_int),
+    ("legal_charges",      "Legal Charges",            "legal charges (15k)",            normalize_money),
+]
+
+
 # ── Sanity checks (warnings only, do not affect verdict) ─────────────────────
 
 def _sanity_check_area(sheet_row: dict) -> list:
@@ -478,6 +634,17 @@ def run_comparison(extraction: dict, sheet_row: dict) -> ComparisonResult:
         _compare_area_sqm(extraction, sheet_row),
         _compare_area_sqft(extraction, sheet_row),
     ]
+
+    # Append the remaining sheet-comparable fields, but only those the extraction
+    # actually contains — so a core-only (4-field) extraction is unchanged.
+    for contract_key, display_name, sheet_header, normalizer in _OPTIONAL_FIELD_SPECS:
+        if contract_key in extraction:
+            fields.append(
+                _compare_simple_field(
+                    extraction, sheet_row, contract_key,
+                    display_name, sheet_header, normalizer,
+                )
+            )
 
     warnings = _sanity_check_area(sheet_row)
     schema_caveats = [f.detail for f in fields if f.status == SCHEMA_CAVEAT]
