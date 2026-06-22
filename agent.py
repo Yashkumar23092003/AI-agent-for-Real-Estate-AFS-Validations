@@ -33,7 +33,7 @@ def convert_pdf_to_base64_images(pdf_bytes):
         base64_images = []
         for page in doc:
             # matrix increases resolution for better OCR by OpenAI
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) 
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img_bytes = pix.tobytes("jpeg")
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             base64_images.append(f"data:image/jpeg;base64,{b64}")
@@ -133,10 +133,15 @@ def _extract_afs_text(afs_bytes: bytes, afs_filename: str = "afs_document.pdf") 
     return afs_text, afs_truncated
 
 
-def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_list: list, afs_filename: str = "afs_document.pdf"):
+def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_list: list, afs_filename: str = "afs_document.pdf", afs_text: str | None = None, afs_truncated: bool = False):
     """
     Passes the documents to OpenAI (gpt-4o) to perform the KYC cross-verification
     based strictly on the system prompt rules.
+
+    If `afs_text` is provided, the AFS PDF text extraction is skipped and the
+    supplied text is used as-is (so a caller running multiple checks can extract
+    once and share the result). `afs_truncated` should accompany a supplied
+    `afs_text` to render the truncation note correctly.
     """
     # Validate file sizes before processing
     validate_file_sizes(afs_bytes, aadhaar_list, pan_list)
@@ -158,7 +163,8 @@ def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_li
         print(f"Warning: Could not read system_prompt.md: {e}")
         system_instruction = "You are a KYC Verification Agent. Verify that AFS matches KYC documents exactly."
 
-    afs_text, afs_truncated = _extract_afs_text(afs_bytes, afs_filename)
+    if afs_text is None:
+        afs_text, afs_truncated = _extract_afs_text(afs_bytes, afs_filename)
 
     truncation_note = ""
     if afs_truncated:
@@ -166,7 +172,7 @@ def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_li
 
     prompt_text = f"""
     Please perform the full KYC verification for the provided documents.
-    
+
     Document 1 is the Agreement for Sale (AFS). Below is the text content extracted from the AFS PDF:
     --- START AFS TEXT ---
     {afs_text}
@@ -174,7 +180,7 @@ def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_li
     {truncation_note}
     We have provided the Aadhaar Card(s) and PAN Card(s) as images below.
     Note: Multiple Aadhaar Cards and/or PAN Cards may be provided for joint/co-applicants.
-    
+
     Output the final Verification Report EXACTLY as specified in your instructions. Additionally, please return a JSON block at the very end of your response enclosed in ```json ... ``` with the following keys. DO NOT output any conversational text (like "Here is the JSON output") before the JSON block.
     - "status": "MATCH" or "MISMATCH" (Overall status)
     - "buyer_name": "Full name of the primary buyer"
@@ -207,9 +213,9 @@ def verify_documents(afs_bytes: bytes, afs_mime: str, aadhaar_list: list, pan_li
         temperature=0.1,
         max_tokens=4096
     )
-    
+
     text_response = response.choices[0].message.content
-    
+
     # Extract JSON from the response — use the LAST json block to avoid false matches
     json_data = {}
     try:
@@ -316,40 +322,81 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
+# Maps the prompt's "field" names (afs_sheet_system_prompt.md, section A) to
+# the extraction-contract keys comparator.py knows how to compare.
+SHEET_FIELD_MAP = {
+    "AGREEMENT_VALUE": "agreement_value",
+    "UNIT_NUMBER": "unit_number",
+    "FLOOR": "floor",
+    "AREA_SQM": "area_sqm",
+    "AREA_SQFT": "area_sqft",
+    "APPLICANT_NAME": "applicant_name",
+    "APPLICANT_PAN": "applicant_pan",
+    "APPLICANT_EMAIL": "applicant_email",
+    "PARKING_NO": "parking_no",
+    "PARKING_LEVEL": "parking_level",
+    "PARKING_CONF": "parking_conf",
+    "PARKING_LENGTH": "parking_length",
+    "PARKING_WIDTH": "parking_width",
+    "PARKING_HEIGHT": "parking_height",
+    "PARKING_TOTAL_AREA": "parking_total_area",
+    "SHARE_CERT_NO": "share_cert_no",
+    "SHARE_FROM": "share_from",
+    "SHARE_TO": "share_to",
+    "TOTAL_SHARES": "total_shares",
+    "LEGAL_CHARGES": "legal_charges",
+}
+
+
 def _is_new_prompt_format(parsed: dict) -> bool:
-    """Detects the user's prompt output format (has 'fields' list + 'unit_under_test')."""
-    return "fields" in parsed and isinstance(parsed["fields"], list)
+    """
+    Detects a structured prompt output. Accepts either schema:
+      - the current afs_sheet_system_prompt.md output keyed on 'fields', or
+      - the extended schema keyed on 'sheet_comparable_fields'.
+    """
+    return (
+        isinstance(parsed.get("fields"), list)
+        or isinstance(parsed.get("sheet_comparable_fields"), list)
+    )
 
 
 def _adapt_new_prompt_format(parsed: dict) -> dict:
     """
-    Converts the user's prompt output JSON into the extraction contract format
+    Converts the prompt's output JSON into the extraction contract format
     that comparator.py and validate_extraction() expect.
 
-    The LLM's own comparison results are discarded — Python is authoritative.
-    Only the AFS extraction data (occurrences, values, internal status) is kept.
+    The LLM's own comparison results (MATCH/MISMATCH/etc.) are discarded for
+    every sheet-comparable field — Python is authoritative. Only the AFS
+    extraction data (occurrences, values, internal status) is kept. The LLM's
+    derived-check fields, info-only fields, and confidence flags are carried
+    through unchanged for display only — they don't affect the verdict.
     """
-    FIELD_MAP = {
-        "AGREEMENT_VALUE": "agreement_value",
-        "UNIT_NUMBER": "unit_number",
-        "AREA_SQM": "area_sqm",
-        "AREA_SQFT": "area_sqft",
-    }
-
     contract: dict = {
         "afs_meta": {
             "buyer_name": parsed.get("buyer_name", "Unknown"),
             "project_name": parsed.get("project_name", "Unknown"),
             "afs_date": parsed.get("afs_date", "Unknown"),
-        }
+        },
+        "llm_derived_check_fields": parsed.get("derived_check_fields", []),
+        "llm_info_only_fields": parsed.get("info_only_fields", []),
+        "llm_out_of_scope_sheet_columns": parsed.get("out_of_scope_sheet_columns", []),
+        "llm_low_confidence_or_unverifiable": parsed.get("low_confidence_or_unverifiable", []),
+        "llm_internal_sanity_checks": parsed.get("internal_sanity_checks", {}),
     }
 
     any_discrepancy = False
     any_missing = False
 
-    for f in parsed.get("fields", []):
+    # Accept either the extended 'sheet_comparable_fields' schema or the current
+    # afs_sheet_system_prompt.md 'fields' schema. The occurrence-key fallbacks
+    # below (anchor/location, raw/raw_text, normalized/value) handle both.
+    field_list = parsed.get("sheet_comparable_fields")
+    if not isinstance(field_list, list):
+        field_list = parsed.get("fields", [])
+
+    for f in field_list:
         fname = f.get("field", "").upper()
-        contract_key = FIELD_MAP.get(fname)
+        contract_key = SHEET_FIELD_MAP.get(fname)
         if not contract_key:
             continue
 
@@ -359,9 +406,10 @@ def _adapt_new_prompt_format(parsed: dict) -> dict:
         # Normalise occurrence objects to extraction contract shape
         occurrences = [
             {
-                "location": occ.get("location", ""),
+                "location": occ.get("anchor", occ.get("location", "")),
                 "raw_text": occ.get("raw", occ.get("raw_text", "")),
                 "value": occ.get("normalized", occ.get("value", "")),
+                "confidence": occ.get("confidence", ""),
             }
             for occ in raw_occurrences
         ]
@@ -397,7 +445,7 @@ def _adapt_new_prompt_format(parsed: dict) -> dict:
 
         contract[contract_key] = field_entry
 
-    # Fill any fields the LLM omitted
+    # Fill in the required core fields if the LLM omitted them
     for key in ("unit_number", "agreement_value", "area_sqm", "area_sqft"):
         if key not in contract:
             contract[key] = {
@@ -417,6 +465,81 @@ def _adapt_new_prompt_format(parsed: dict) -> dict:
     return contract
 
 
+# Recital letters and clause numbers actually referenced as anchors in
+# afs_sheet_system_prompt.md (Section A/B/C). Everything else in a "Superb
+# Altura" AFS — background recitals, boilerplate reps/warranties, the First
+# Schedule — carries no field anchor and is safe to drop before sending to the
+# LLM, purely to cut input tokens.
+_KEEP_RECITAL_LETTERS = set("QRSTUXYZ")
+_KEEP_CLAUSE_NUMBERS = {"1", "6", "15"}
+
+
+def _filter_lettered_block(block: str, keep_letters: set) -> str:
+    starts = list(re.finditer(r'(?m)^([A-Z])\.\s', block))
+    found = {m.group(1) for m in starts}
+    if len(starts) < 10 or not keep_letters.issubset(found):
+        raise ValueError(f"recital structure mismatch: found={sorted(found)}")
+    kept = []
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(block)
+        if m.group(1) in keep_letters:
+            kept.append(block[m.start():end])
+    return "".join(kept)
+
+
+def _filter_numbered_block(block: str, keep_numbers: set) -> str:
+    starts = list(re.finditer(r'(?m)^(\d{1,2})\.\s', block))
+    found = {m.group(1) for m in starts}
+    if len(starts) < 8 or not keep_numbers.issubset(found):
+        raise ValueError(f"clause structure mismatch: found={sorted(found)}")
+    kept = []
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(block)
+        if m.group(1) in keep_numbers:
+            kept.append(block[m.start():end])
+    return "".join(kept)
+
+
+def _filter_afs_text_for_llm(afs_text: str) -> str:
+    """
+    Drops AFS sections that carry no field anchor referenced anywhere in
+    afs_sheet_system_prompt.md (Section A/B/C tables): background recitals
+    (land/society history), boilerplate representations/warranties clauses,
+    and the First Schedule (land boundary description). Every anchor quoted in
+    the prompt lives in the page-1 header, recitals Q/R/S/T/U/X/Y/Z, clauses
+    1/6/15, or from the Second Schedule (Parts A/B/C) onward — all preserved
+    unfiltered. This is a token-cost optimization only.
+
+    Falls back to the original, unfiltered text if the expected recital/clause
+    numbering isn't found (e.g. a differently structured document) — nothing
+    is ever silently dropped on a document that doesn't match this structure.
+    """
+    try:
+        whereas = re.search(r'(?m)^WHEREAS:?\s*$', afs_text)
+        deed = re.search(r'NOW THIS DEED WITH?NESSETH', afs_text)
+        second_schedule = re.search(r'SECOND SCHEDULE HEREINABOVE REFERRED TO', afs_text)
+        if not (whereas and deed and second_schedule):
+            raise ValueError("expected section headings not found")
+
+        header = afs_text[:whereas.end()]
+        recitals_block = afs_text[whereas.end():deed.start()]
+        clauses_block = afs_text[deed.start():second_schedule.start()]
+        schedules_onward = afs_text[second_schedule.start():]
+
+        filtered = (
+            header
+            + _filter_lettered_block(recitals_block, _KEEP_RECITAL_LETTERS)
+            + _filter_numbered_block(clauses_block, _KEEP_CLAUSE_NUMBERS)
+            + schedules_onward
+        )
+    except Exception:
+        return afs_text
+
+    if 0 < len(filtered) < len(afs_text):
+        return filtered
+    return afs_text
+
+
 def _call_sheet_extraction_llm(afs_text: str, sheet_row: dict) -> dict:
     """
     Sends AFS text + sheet row to GPT-4o using the configured prompt.
@@ -425,6 +548,7 @@ def _call_sheet_extraction_llm(afs_text: str, sheet_row: dict) -> dict:
     with open(_SHEET_PROMPT_PATH, "r", encoding="utf-8") as f:
         sheet_prompt = f.read()
 
+    afs_text = _filter_afs_text_for_llm(afs_text)
     sheet_row_text = _format_sheet_row_for_llm(sheet_row)
     user_prompt = (
         f"AFS_TEXT:\n{afs_text[:MAX_AFS_TEXT_CHARS]}\n\n"
@@ -443,15 +567,23 @@ def _call_sheet_extraction_llm(afs_text: str, sheet_row: dict) -> dict:
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.0,
-        max_tokens=3000,
+        max_tokens=16384,  # gpt-4o's hard output ceiling — the new prompt's schema needs ~15.7k tokens for a real AFS
     )
 
     text_response = response.choices[0].message.content.strip()
+    finish_reason = response.choices[0].finish_reason
 
     parsed = _extract_json_object(text_response)
     if not parsed:
+        truncation_note = (
+            "\n\nThe response was cut off (hit the max_tokens limit) before the JSON "
+            "finished — the field list, evidence quotes, or sanity checks are likely "
+            "too long for the current limit. Consider raising max_tokens further."
+            if finish_reason == "length" else ""
+        )
         raise ValueError(
-            f"LLM did not return valid JSON.\nResponse excerpt:\n{text_response[:600]}"
+            f"LLM did not return valid JSON (finish_reason={finish_reason}).{truncation_note}\n"
+            f"Response excerpt:\n{text_response[:600]}"
         )
 
     if _is_new_prompt_format(parsed):
@@ -470,6 +602,7 @@ def verify_afs_against_sheet(
     sheet_id: str,
     tab: str,
     use_fixture: bool = False,
+    afs_text: str | None = None,
 ) -> dict:
     """
     Full pipeline: extract fields from AFS -> fetch Google Sheet row -> compare.
@@ -486,7 +619,8 @@ def verify_afs_against_sheet(
     from sheets import get_worksheet, find_unit_row
 
     prompt_configured = not _sheet_prompt_is_placeholder()
-    afs_text, _ = _extract_afs_text(afs_bytes, afs_filename)
+    if afs_text is None:
+        afs_text, _ = _extract_afs_text(afs_bytes, afs_filename)
 
     if use_fixture or not prompt_configured:
         # ── Fixture path ────────────────────────────────────────────────────
@@ -537,4 +671,75 @@ def verify_afs_against_sheet(
         "afs_meta": afs_meta,
         "used_fixture": used_fixture,
         "prompt_configured": prompt_configured,
+        # Informational only — reported by the LLM, not re-verified by Python.
+        "derived_check_fields": extraction.get("llm_derived_check_fields", []),
+        "info_only_fields": extraction.get("llm_info_only_fields", []),
+        "out_of_scope_sheet_columns": extraction.get("llm_out_of_scope_sheet_columns", []),
+        "low_confidence_or_unverifiable": extraction.get("llm_low_confidence_or_unverifiable", []),
+        "internal_sanity_checks": extraction.get("llm_internal_sanity_checks", {}),
     }
+
+
+# ── Unified verification (KYC + Sheet in one go) ───────────────────────────────
+
+def verify_unified(
+    afs_bytes: bytes,
+    afs_mime: str,
+    aadhaar_list: list,
+    pan_list: list,
+    sheet_id: str,
+    tab: str,
+    afs_filename: str = "afs_document.pdf",
+    use_fixture: bool = False,
+) -> dict:
+    """
+    Runs both verifications from a single AFS upload, sharing one text extraction:
+
+      1. KYC cross-verification (AFS + Aadhaar/PAN images, LLM-authoritative).
+      2. AFS ↔ Google Sheet field audit (text-only, Python-authoritative).
+
+    The two checks remain independent LLM calls — only the AFS text extraction
+    is shared — so accuracy is identical to running each tab separately.
+
+    Returns:
+      {
+        "kyc":   {"report_text": str, "json_data": dict} | {"error": str},
+        "sheet": <verify_afs_against_sheet result dict>   | {"error": str},
+      }
+
+    Each check is isolated: a failure in one is captured as {"error": ...} and
+    does not prevent the other from running or being returned.
+    """
+    # Extract the AFS text exactly once and feed it to both checks.
+    afs_text, afs_truncated = _extract_afs_text(afs_bytes, afs_filename)
+
+    result: dict = {}
+
+    try:
+        kyc_report, kyc_json = verify_documents(
+            afs_bytes=afs_bytes,
+            afs_mime=afs_mime,
+            aadhaar_list=aadhaar_list,
+            pan_list=pan_list,
+            afs_filename=afs_filename,
+            afs_text=afs_text,
+            afs_truncated=afs_truncated,
+        )
+        result["kyc"] = {"report_text": kyc_report, "json_data": kyc_json}
+    except Exception as e:
+        result["kyc"] = {"error": str(e)}
+
+    try:
+        sheet_result = verify_afs_against_sheet(
+            afs_bytes=afs_bytes,
+            afs_filename=afs_filename,
+            sheet_id=sheet_id,
+            tab=tab,
+            use_fixture=use_fixture,
+            afs_text=afs_text,
+        )
+        result["sheet"] = sheet_result
+    except Exception as e:
+        result["sheet"] = {"error": str(e)}
+
+    return result

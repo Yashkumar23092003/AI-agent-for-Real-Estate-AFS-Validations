@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import pandas as pd
-from agent import verify_documents, verify_afs_against_sheet, _sheet_prompt_is_placeholder
+from agent import verify_documents, verify_afs_against_sheet, verify_unified, _sheet_prompt_is_placeholder
 from notifier import generate_match_email, generate_mismatch_email, generate_sheet_audit_email
 from database import (
     init_db, save_verification, get_all_verifications_df, get_report_by_id,
@@ -9,6 +9,224 @@ from database import (
 )
 from pdf_report import generate_pdf_report, generate_sheet_audit_pdf
 from comparator import MATCH, MISMATCH, SCHEMA_CAVEAT, INTERNAL_DISCREPANCY, NOT_FOUND_IN_AFS, NOT_FOUND_IN_SHEET
+
+
+# ── Shared result renderers (used by both individual tabs and the unified tab) ──
+
+def render_kyc_result(report_text, json_data, crm_email, key_prefix):
+    """Render a KYC verification result: history save, CRM email, PDF, report."""
+    st.subheader("KYC Verification — Action Taken")
+    status = json_data.get("status", "MISMATCH")
+    buyer_name = json_data.get("buyer_name", "Unknown Client")
+    project_name = json_data.get("project_name", "Unknown Project")
+    unit_number = json_data.get("unit_number", "Unknown Unit")
+    afs_date = json_data.get("afs_date", "Unknown Date")
+
+    save_verification(buyer_name, project_name, unit_number, status, report_text)
+    st.toast("💾 KYC record saved to History!")
+
+    if status == "MATCH":
+        st.info("✅ All KYC fields match. Triggering success email to CRM.")
+        success = generate_match_email(
+            crm_email=crm_email,
+            buyer_name=buyer_name,
+            project_name=project_name,
+            unit_number=unit_number,
+            afs_date=afs_date,
+            report_text=report_text,
+        )
+    else:
+        st.error("❌ KYC mismatches found. Triggering action-required email to CRM.")
+        success = generate_mismatch_email(
+            crm_email=crm_email,
+            buyer_name=buyer_name,
+            project_name=project_name,
+            unit_number=unit_number,
+            afs_date=afs_date,
+            mismatches_text=json_data.get("mismatches_text", "Please review the attached report for mismatches."),
+            report_text=report_text,
+        )
+
+    if success:
+        st.toast("📧 KYC email successfully sent to CRM!")
+    else:
+        st.warning("⚠️ Could not send KYC email. Please check your SMTP credentials in the .env file.")
+
+    st.subheader("KYC Verification Report")
+    pdf_bytes = generate_pdf_report(report_text, buyer_name, json_data=json_data)
+    st.download_button(
+        label="📥 Download KYC Report as PDF",
+        data=pdf_bytes,
+        file_name=f"KYC_Report_{buyer_name.replace(' ', '_')}.pdf",
+        mime="application/pdf",
+        key=f"{key_prefix}_kyc_pdf",
+    )
+    st.markdown(report_text)
+
+
+def render_sheet_result(result, sheet_id, tab_name, afs_filename, crm_email, key_prefix):
+    """Render an AFS↔Sheet audit result: verdict, field table, history, email, PDF."""
+    verdict = result["verdict"]
+    fields = result["fields"]
+    warnings = result["warnings"]
+    schema_caveats = result["schema_caveats"]
+    afs_meta = result["afs_meta"]
+    buyer_name = afs_meta.get("buyer_name", "Unknown")
+    project_name = afs_meta.get("project_name", "Unknown")
+    unit_no = (
+        result["extraction"].get("unit_number", {}).get("distinct_values", ["?"])[0]
+    )
+
+    if result["used_fixture"]:
+        st.info("ℹ️ Results shown using **fixture data** (Unit 313). Live extraction requires a configured prompt.")
+
+    # Verdict banner
+    if verdict == "PASS":
+        st.success("✅ **PASS** — All verified fields match the Google Sheet.")
+    else:
+        st.error("❌ **FAIL** — One or more fields do not match the Google Sheet.")
+
+    # Warnings and caveats
+    for w in warnings:
+        st.warning(f"⚠️ {w}")
+    for c in schema_caveats:
+        st.info(f"ℹ️ Schema caveat: {c}")
+
+    # ── Field-by-field table ────────────────────────────────────────
+    st.subheader("Field-by-Field Results")
+
+    STATUS_EMOJI = {
+        MATCH: "✅ MATCH",
+        MISMATCH: "❌ MISMATCH",
+        SCHEMA_CAVEAT: "⚠️ SCHEMA CAVEAT",
+        INTERNAL_DISCREPANCY: "🔴 INTERNAL DISCREPANCY",
+        NOT_FOUND_IN_AFS: "❓ NOT IN AFS",
+        NOT_FOUND_IN_SHEET: "❓ NOT IN SHEET",
+    }
+
+    rows = []
+    for f in fields:
+        afs_raw = "; ".join(
+            f"{o.get('location','')}: {o.get('raw_text','')}"
+            for o in f.afs_occurrences
+        ) or " | ".join(f.afs_distinct_values)
+        rows.append({
+            "Status": STATUS_EMOJI.get(f.status, f.status),
+            "Field": f.field_name,
+            "AFS Raw Occurrences": afs_raw,
+            "Sheet Raw": str(f.sheet_raw),
+            "AFS Normalized": str(f.afs_normalized) if f.afs_normalized else "—",
+            "Sheet Normalized": str(f.sheet_normalized) if f.sheet_normalized else "—",
+            "Detail / Notes": f.detail or "",
+        })
+
+    df_fields = pd.DataFrame(rows)
+
+    def _colour_status(val):
+        if "MATCH" in val and "MISMATCH" not in val:
+            return "background-color: #d1fae5; color: #065f46;"
+        if "MISMATCH" in val or "DISCREPANCY" in val:
+            return "background-color: #fee2e2; color: #991b1b;"
+        if "CAVEAT" in val or "NOT IN" in val:
+            return "background-color: #fef3c7; color: #92400e;"
+        return ""
+
+    styled = df_fields.style.map(_colour_status, subset=["Status"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ── Low-confidence / unverifiable flags (reported by the LLM) ──
+    low_confidence = result.get("low_confidence_or_unverifiable", [])
+    if low_confidence:
+        st.warning(
+            "⚠️ **Needs human review** — the extraction flagged these as "
+            "low-confidence or unverifiable:\n\n"
+            + "\n".join(f"- {item}" for item in low_confidence)
+        )
+
+    # ── Derived-check fields (rate, milestones — informational, not verdict-affecting) ──
+    derived_fields = result.get("derived_check_fields", [])
+    if derived_fields:
+        st.subheader("Derived Checks (model-computed — verify independently)")
+        derived_rows = [{
+            "Field": d.get("field", ""),
+            "Operation": d.get("operation", ""),
+            "Operands": str(d.get("operands", "")),
+            "Computed Result": str(d.get("model_computed_result", "")),
+            "Sheet Raw": str(d.get("sheet_raw", "")),
+            "Status": d.get("status", ""),
+            "Note": d.get("note", ""),
+        } for d in derived_fields]
+        st.dataframe(pd.DataFrame(derived_rows), use_container_width=True, hide_index=True)
+
+    # ── Info-only fields (not in AFS-vs-Sheet scope, reported for context) ──
+    info_fields = result.get("info_only_fields", [])
+    if info_fields:
+        st.subheader("Info-Only Fields (no verdict impact)")
+        info_rows = []
+        for inf in info_fields:
+            occ_text = "; ".join(
+                f"{o.get('anchor','')}: {o.get('raw', o.get('evidence',''))}"
+                for o in inf.get("afs_occurrences", [])
+            )
+            info_rows.append({
+                "Field": inf.get("field", ""),
+                "AFS Occurrences": occ_text,
+                "AFS Internal Status": inf.get("afs_internal_status", ""),
+                "Note": inf.get("note", ""),
+            })
+        st.dataframe(pd.DataFrame(info_rows), use_container_width=True, hide_index=True)
+
+    # ── Internal sanity checks (figure-vs-words, sq.m→sq.ft, sums — model-computed) ──
+    sanity_checks = result.get("internal_sanity_checks", {})
+    if sanity_checks:
+        with st.expander("🧮 Internal Sanity Checks (model-computed, verify independently)"):
+            for key, val in sanity_checks.items():
+                st.markdown(f"**{key.replace('_', ' ').title()}**: {val}")
+
+    # ── Sheet columns the prompt explicitly treats as out of scope ──
+    out_of_scope = result.get("out_of_scope_sheet_columns", [])
+    if out_of_scope:
+        with st.expander("Out-of-scope Sheet columns"):
+            st.caption(", ".join(out_of_scope))
+
+    # ── Save to history ─────────────────────────────────────────────
+    save_sheet_audit(
+        unit_no=unit_no,
+        buyer_name=buyer_name,
+        project_name=project_name,
+        sheet_id=sheet_id,
+        tab_name=tab_name,
+        verdict=verdict,
+        fields=fields,
+        afs_filename=afs_filename,
+    )
+    st.toast("💾 Audit record saved to History!")
+
+    # ── Email ────────────────────────────────────────────────────────
+    email_ok = generate_sheet_audit_email(
+        crm_email=crm_email,
+        buyer_name=buyer_name,
+        unit_no=unit_no,
+        project_name=project_name,
+        verdict=verdict,
+        fields=fields,
+        warnings=warnings,
+    )
+    if email_ok:
+        st.toast("📧 Audit email sent to CRM!")
+    else:
+        st.warning("⚠️ Could not send audit email. Check SMTP credentials in .env.")
+
+    # ── PDF download ─────────────────────────────────────────────────
+    pdf_bytes = generate_sheet_audit_pdf(result)
+    st.download_button(
+        label="📥 Download Audit Report as PDF",
+        data=pdf_bytes,
+        file_name=f"SheetAudit_{unit_no}_{buyer_name.replace(' ', '_')}.pdf",
+        mime="application/pdf",
+        key=f"{key_prefix}_sheet_pdf",
+    )
+
 
 # Initialize database once
 @st.cache_resource
@@ -25,7 +243,7 @@ st.markdown("Upload the client's Agreement for Sale (AFS) and their KYC document
 with st.sidebar:
     st.header("Settings")
     crm_email = st.text_input("CRM Officer Email", value=os.environ.get("SMTP_EMAIL", "crm@example.com"))
-    
+
     st.markdown("---")
     st.markdown("**Instructions:**")
     st.markdown("1. Upload the AFS (PDF format).")
@@ -35,7 +253,115 @@ with st.sidebar:
     st.markdown("---")
     st.caption("⚠️ Max file size: 15 MB per document.")
 
-tab1, tab2, tab3 = st.tabs(["🆕 KYC Verification", "🔢 AFS ↔ Sheet Audit", "📚 Verification History"])
+tab0, tab1, tab2, tab3 = st.tabs([
+    "🚀 Unified Verification",
+    "🆕 KYC Verification",
+    "🔢 AFS ↔ Sheet Audit",
+    "📚 Verification History",
+])
+
+with tab0:
+    st.header("Unified Verification — KYC + Sheet Audit in one go")
+    st.markdown(
+        "Upload the AFS **once**. The agent runs both checks from a single extraction: "
+        "(1) **KYC cross-verification** against Aadhaar/PAN, and (2) the **AFS ↔ Google Sheet** "
+        "field audit. The two checks stay independent under the hood, so accuracy is identical "
+        "to running each tab separately."
+    )
+
+    if _sheet_prompt_is_placeholder():
+        st.warning(
+            "⚙️ **Sheet extraction prompt not configured.** `afs_sheet_system_prompt.md` is still a "
+            "placeholder, so the Sheet audit will use the **built-in fixture** (Unit 313). The KYC "
+            "check runs normally."
+        )
+
+    u_col1, u_col2, u_col3 = st.columns(3)
+    with u_col1:
+        u_afs_file = st.file_uploader("1. Agreement for Sale (AFS)", type=["pdf"], key="u_afs")
+    with u_col2:
+        u_aadhaar_files = st.file_uploader(
+            "2. Aadhaar Card(s)", type=["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=True, key="u_aadhaar",
+        )
+    with u_col3:
+        u_pan_files = st.file_uploader(
+            "3. PAN Card(s)", type=["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=True, key="u_pan",
+        )
+
+    u_col_s1, u_col_s2 = st.columns(2)
+    with u_col_s1:
+        u_default_sheet_id = os.environ.get("DEFAULT_SHEET_ID", "1pdRt04-OgUvEQJLXqZXBtZJO2Cs7Yg4KwfmW7k7heYg")
+        u_sheet_id_input = st.text_input("4. Google Sheet ID", value=u_default_sheet_id, key="u_sheet_id")
+    with u_col_s2:
+        u_tab_name_input = st.text_input("5. Sheet Tab Name", value="Sheet1", key="u_tab_name")
+
+    with st.expander("⚙️ Developer options"):
+        u_use_fixture_cb = st.checkbox(
+            "Force fixture for Sheet audit (skip LLM extraction, use hardcoded Unit 313 data)",
+            value=_sheet_prompt_is_placeholder(),
+            key="u_use_fixture",
+        )
+
+    if st.button("🚀 Run Unified Verification", type="primary", key="run_unified"):
+        if not u_afs_file or not u_aadhaar_files or not u_pan_files:
+            st.warning("⚠️ Please upload the AFS, Aadhaar Card(s), and PAN Card(s) to proceed.")
+        elif not u_sheet_id_input.strip():
+            st.warning("⚠️ Please enter a Google Sheet ID.")
+        elif not u_tab_name_input.strip():
+            st.warning("⚠️ Please enter the sheet tab name.")
+        else:
+            with st.spinner("🤖 Running KYC verification and Sheet audit... This may take a minute."):
+                try:
+                    u_aadhaar_list = [
+                        {"bytes": f.getvalue(), "mime": f.type, "filename": f.name}
+                        for f in u_aadhaar_files
+                    ]
+                    u_pan_list = [
+                        {"bytes": f.getvalue(), "mime": f.type, "filename": f.name}
+                        for f in u_pan_files
+                    ]
+                    unified = verify_unified(
+                        afs_bytes=u_afs_file.getvalue(),
+                        afs_mime=u_afs_file.type,
+                        aadhaar_list=u_aadhaar_list,
+                        pan_list=u_pan_list,
+                        sheet_id=u_sheet_id_input.strip(),
+                        tab=u_tab_name_input.strip(),
+                        afs_filename=u_afs_file.name,
+                        use_fixture=u_use_fixture_cb,
+                    )
+                except Exception as e:
+                    st.error(f"An error occurred during unified verification: {e}")
+                    st.stop()
+
+            st.success("Unified Verification Complete!")
+
+            # ── KYC section ────────────────────────────────────────────────
+            st.markdown("## 🆔 KYC Verification")
+            kyc = unified.get("kyc", {})
+            if "error" in kyc:
+                st.error(f"❌ KYC verification failed: {kyc['error']}")
+            else:
+                render_kyc_result(kyc["report_text"], kyc["json_data"], crm_email, key_prefix="unified")
+
+            st.markdown("---")
+
+            # ── Sheet audit section ────────────────────────────────────────
+            st.markdown("## 🔢 AFS ↔ Sheet Audit")
+            sheet = unified.get("sheet", {})
+            if "error" in sheet:
+                st.error(f"❌ Sheet audit failed: {sheet['error']}")
+            else:
+                render_sheet_result(
+                    sheet,
+                    sheet_id=u_sheet_id_input.strip(),
+                    tab_name=u_tab_name_input.strip(),
+                    afs_filename=u_afs_file.name,
+                    crm_email=crm_email,
+                    key_prefix="unified",
+                )
 
 with tab1:
     col1, col2, col3 = st.columns(3)
@@ -63,7 +389,7 @@ with tab1:
                             "mime": f.type,
                             "filename": f.name
                         })
-                        
+
                     pan_list = []
                     for f in pan_files:
                         pan_list.append({
@@ -79,61 +405,10 @@ with tab1:
                         pan_list=pan_list,
                         afs_filename=afs_file.name
                     )
-                    
+
                     st.success("Verification Complete!")
-                    
-                    # Handle Email Trigger and Data Extraction
-                    st.subheader("Action Taken")
-                    status = json_data.get("status", "MISMATCH")
-                    buyer_name = json_data.get("buyer_name", "Unknown Client")
-                    project_name = json_data.get("project_name", "Unknown Project")
-                    unit_number = json_data.get("unit_number", "Unknown Unit")
-                    afs_date = json_data.get("afs_date", "Unknown Date")
-                    
-                    # Save to history database
-                    save_verification(buyer_name, project_name, unit_number, status, report_text)
-                    st.toast("💾 Record saved to History!")
-                    
-                    if status == "MATCH":
-                        st.info("✅ All fields match. Triggering success email to CRM.")
-                        success = generate_match_email(
-                            crm_email=crm_email,
-                            buyer_name=buyer_name,
-                            project_name=project_name,
-                            unit_number=unit_number,
-                            afs_date=afs_date,
-                            report_text=report_text
-                        )
-                    else:
-                        st.error("❌ Mismatches found. Triggering action-required email to CRM.")
-                        success = generate_mismatch_email(
-                            crm_email=crm_email,
-                            buyer_name=buyer_name,
-                            project_name=project_name,
-                            unit_number=unit_number,
-                            afs_date=afs_date,
-                            mismatches_text=json_data.get("mismatches_text", "Please review the attached report for mismatches."),
-                            report_text=report_text
-                        )
-                    
-                    if success:
-                        st.toast("📧 Email successfully sent to CRM!")
-                    else:
-                        st.warning("⚠️ Could not send email. Please check your SMTP credentials in the .env file.")
-                        
-                    # Display the report
-                    st.subheader("Verification Report")
-                    # Generate PDF for download
-                    pdf_bytes = generate_pdf_report(report_text, buyer_name, json_data=json_data)
-                    st.download_button(
-                        label="📥 Download Report as PDF",
-                        data=pdf_bytes,
-                        file_name=f"KYC_Report_{buyer_name.replace(' ', '_')}.pdf",
-                        mime="application/pdf",
-                        key="download_new_report"
-                    )
-                    st.markdown(report_text)
-                        
+                    render_kyc_result(report_text, json_data, crm_email, key_prefix="tab1")
+
                 except Exception as e:
                     st.error(f"An error occurred during verification: {e}")
 
@@ -192,117 +467,20 @@ with tab2:
                     st.error(f"❌ Audit failed: {e}")
                     st.stop()
 
-            verdict = result["verdict"]
-            fields = result["fields"]
-            warnings = result["warnings"]
-            schema_caveats = result["schema_caveats"]
-            afs_meta = result["afs_meta"]
-            buyer_name = afs_meta.get("buyer_name", "Unknown")
-            project_name = afs_meta.get("project_name", "Unknown")
-            unit_no = (
-                result["extraction"].get("unit_number", {}).get("distinct_values", ["?"])[0]
-            )
-
-            if result["used_fixture"]:
-                st.info("ℹ️ Results shown using **fixture data** (Unit 313). Live extraction requires a configured prompt.")
-
-            # Verdict banner
-            if verdict == "PASS":
-                st.success("✅ **PASS** — All verified fields match the Google Sheet.")
-            else:
-                st.error("❌ **FAIL** — One or more fields do not match the Google Sheet.")
-
-            # Warnings and caveats
-            for w in warnings:
-                st.warning(f"⚠️ {w}")
-            for c in schema_caveats:
-                st.info(f"ℹ️ Schema caveat: {c}")
-
-            # ── Field-by-field table ────────────────────────────────────────
-            st.subheader("Field-by-Field Results")
-
-            STATUS_EMOJI = {
-                MATCH: "✅ MATCH",
-                MISMATCH: "❌ MISMATCH",
-                SCHEMA_CAVEAT: "⚠️ SCHEMA CAVEAT",
-                INTERNAL_DISCREPANCY: "🔴 INTERNAL DISCREPANCY",
-                NOT_FOUND_IN_AFS: "❓ NOT IN AFS",
-                NOT_FOUND_IN_SHEET: "❓ NOT IN SHEET",
-            }
-
-            rows = []
-            for f in fields:
-                afs_raw = "; ".join(
-                    f"{o.get('location','')}: {o.get('raw_text','')}"
-                    for o in f.afs_occurrences
-                ) or " | ".join(f.afs_distinct_values)
-                rows.append({
-                    "Status": STATUS_EMOJI.get(f.status, f.status),
-                    "Field": f.field_name,
-                    "AFS Raw Occurrences": afs_raw,
-                    "Sheet Raw": str(f.sheet_raw),
-                    "AFS Normalized": str(f.afs_normalized) if f.afs_normalized else "—",
-                    "Sheet Normalized": str(f.sheet_normalized) if f.sheet_normalized else "—",
-                    "Detail / Notes": f.detail or "",
-                })
-
-            df_fields = pd.DataFrame(rows)
-
-            def _colour_status(val):
-                if "MATCH" in val and "MISMATCH" not in val:
-                    return "background-color: #d1fae5; color: #065f46;"
-                if "MISMATCH" in val or "DISCREPANCY" in val:
-                    return "background-color: #fee2e2; color: #991b1b;"
-                if "CAVEAT" in val or "NOT IN" in val:
-                    return "background-color: #fef3c7; color: #92400e;"
-                return ""
-
-            styled = df_fields.style.map(_colour_status, subset=["Status"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-
-            # ── Save to history ─────────────────────────────────────────────
-            save_sheet_audit(
-                unit_no=unit_no,
-                buyer_name=buyer_name,
-                project_name=project_name,
+            render_sheet_result(
+                result,
                 sheet_id=sheet_id_input.strip(),
                 tab_name=tab_name_input.strip(),
-                verdict=verdict,
-                fields=fields,
                 afs_filename=sheet_afs_file.name,
-            )
-            st.toast("💾 Audit record saved to History!")
-
-            # ── Email ────────────────────────────────────────────────────────
-            email_ok = generate_sheet_audit_email(
                 crm_email=crm_email,
-                buyer_name=buyer_name,
-                unit_no=unit_no,
-                project_name=project_name,
-                verdict=verdict,
-                fields=fields,
-                warnings=warnings,
-            )
-            if email_ok:
-                st.toast("📧 Audit email sent to CRM!")
-            else:
-                st.warning("⚠️ Could not send email. Check SMTP credentials in .env.")
-
-            # ── PDF download ─────────────────────────────────────────────────
-            pdf_bytes = generate_sheet_audit_pdf(result)
-            st.download_button(
-                label="📥 Download Audit Report as PDF",
-                data=pdf_bytes,
-                file_name=f"SheetAudit_{unit_no}_{buyer_name.replace(' ', '_')}.pdf",
-                mime="application/pdf",
-                key="download_sheet_audit",
+                key_prefix="tab2",
             )
 
 
 with tab3:
     st.header("Past Verifications")
     df = get_all_verifications_df()
-    
+
     if df.empty:
         st.info("No past verifications found. Run a verification to see it here!")
     else:
@@ -312,7 +490,7 @@ with tab3:
             "MATCH": "✅ MATCH",
             "MISMATCH": "❌ MISMATCH"
         }).fillna(df_display["status"])
-        
+
         st.dataframe(
             df_display,
             column_config={
@@ -326,25 +504,25 @@ with tab3:
             use_container_width=True,
             hide_index=True
         )
-        
+
         st.markdown("---")
         st.subheader("View Full Report")
-        
+
         # Let user select a record to view the full text
         record_options = [f"ID {row['id']} - {row['buyer_name']} ({row['date']})" for _, row in df.iterrows()]
         selected_record = st.selectbox("Select a record to view its full report:", record_options)
-        
+
         if selected_record:
             # Extract ID from the selection
             record_id = int(selected_record.split(" ")[1])
             report_text = get_report_by_id(record_id)
-            
+
             # Extract buyer name from selected record text for cleaner file name
             try:
                 name_part = selected_record.split(" - ")[1].split(" (")[0]
             except Exception:
                 name_part = f"Record_{record_id}"
-                
+
             # Reconstruct minimal json_data from the history row for the cover page
             history_row = df[df["id"] == record_id].iloc[0]
             history_json = {
