@@ -146,7 +146,9 @@ KYC_LOG_HEADERS = [
 AFS_LOG_HEADERS = [
     "Timestamp", "Unit No", "Buyer Name", "Project Name",
     "Sheet ID", "Tab", "AFS Filename", "Verdict",
-] + AFS_FIELD_ORDER
+] + [
+    f"{name} {suffix}" for name in AFS_FIELD_ORDER for suffix in ("Status", "AFS", "Sheet")
+]
 
 KYC_LOG_TAB = "KYC_Log"
 AFS_LOG_TAB = "AFS_Log"
@@ -190,14 +192,20 @@ def append_afs_log(unit_no, buyer_name, project_name, sheet_id, tab_name,
                    verdict, fields, afs_filename):
     """
     Appends one row to the AFS_Log tab. `fields` is the list of FieldResult
-    objects; each field's status lands in its canonical column.
+    objects; each field gets a Status/AFS/Sheet column triplet.
     """
     gc = gspread.authorize(_get_credentials())
     ss = gc.open_by_key(_log_sheet_id())
     ws = _get_or_create_tab(ss, AFS_LOG_TAB, AFS_LOG_HEADERS)
 
-    status_by_field = {f.field_name: f.status for f in fields}
-    field_cells = [status_by_field.get(name, "") for name in AFS_FIELD_ORDER]
+    result_by_field = {f.field_name: f for f in fields}
+    field_cells = []
+    for name in AFS_FIELD_ORDER:
+        f = result_by_field.get(name)
+        if f is None:
+            field_cells += ["", "", ""]
+        else:
+            field_cells += [f.status, f.afs_normalized or "", f.sheet_normalized or ""]
     row = [_now(), unit_no, buyer_name, project_name, sheet_id, tab_name,
            afs_filename, verdict] + field_cells
     ws.append_row(row, value_input_option="USER_ENTERED")

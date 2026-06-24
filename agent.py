@@ -13,6 +13,10 @@ from comparator import run_comparison, validate_extraction
 load_dotenv()
 
 MODEL_NAME = "gpt-4o"
+# Used only for the AFS-vs-Sheet field extraction call: pure text (no images),
+# schema-validated, and the actual verdict is computed deterministically in
+# comparator.py — so a cheaper text model is sufficient here.
+SHEET_EXTRACTION_MODEL_NAME = "gpt-4o-mini"
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SHEET_PROMPT_PATH = os.path.join(_DIR, "afs_sheet_system_prompt.md")
@@ -561,13 +565,13 @@ def _call_sheet_extraction_llm(afs_text: str, sheet_row: dict) -> dict:
 
     client = OpenAI(api_key=api_key, timeout=180.0)
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=SHEET_EXTRACTION_MODEL_NAME,
         messages=[
             {"role": "system", "content": sheet_prompt},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.0,
-        max_tokens=16384,  # gpt-4o's hard output ceiling — the new prompt's schema needs ~15.7k tokens for a real AFS
+        max_tokens=16384,  # gpt-4o-mini's output ceiling — the new prompt's schema needs ~15.7k tokens for a real AFS
     )
 
     text_response = response.choices[0].message.content.strip()
