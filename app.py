@@ -1,14 +1,17 @@
 import streamlit as st
 import os
 import pandas as pd
-from agent import verify_documents, verify_afs_against_sheet, verify_unified, _sheet_prompt_is_placeholder
+from agent import verify_documents, verify_afs_against_sheet, verify_unified, _sheet_prompt_is_placeholder, extract_id_documents
 from notifier import generate_match_email, generate_mismatch_email, generate_sheet_audit_email
 from database import (
     init_db, save_verification, get_all_verifications_df, get_report_by_id,
     save_sheet_audit, get_all_sheet_audits_df, get_sheet_audit_by_id,
 )
 from pdf_report import generate_pdf_report, generate_sheet_audit_pdf
-from sheets import append_kyc_log, append_afs_log
+from sheets import (
+    append_kyc_log, append_afs_log, update_unit_row,
+    PRIMARY_APPLICANT_FIELD_MAP, CO_APPLICANT_FIELD_MAP,
+)
 from comparator import MATCH, MISMATCH, SCHEMA_CAVEAT, INTERNAL_DISCREPANCY, NOT_FOUND_IN_AFS, NOT_FOUND_IN_SHEET, INFO_ONLY
 
 
@@ -278,11 +281,12 @@ with st.sidebar:
     st.markdown("---")
     st.caption("⚠️ Max file size: 15 MB per document.")
 
-tab0, tab1, tab2, tab3 = st.tabs([
+tab0, tab1, tab2, tab3, tab4 = st.tabs([
     "🚀 Unified Verification",
     "🆕 KYC Verification",
     "🔢 AFS ↔ Sheet Audit",
     "📚 Verification History",
+    "🪪 Update KYC → Sheet",
 ])
 
 with tab0:
@@ -626,3 +630,151 @@ with tab3:
                     })
                 if rows_hist:
                     st.dataframe(pd.DataFrame(rows_hist), use_container_width=True, hide_index=True)
+
+
+# ── Tab 4: Update KYC -> Sheet (extract ID docs, write into a Unit row) ────────
+# Additive feature: extracts Aadhaar/PAN/Passport fields and writes them into
+# the matching Unit No. row of an existing Google Sheet. Does not touch any
+# other tab's logic, state, or history.
+
+ID_FIELD_LABELS = {
+    "name": "Full Name",
+    "pan": "PAN Number",
+    "aadhaar": "Aadhaar Number",
+    "passport": "Passport Number",
+    "email": "Email",
+    "address": "Address",
+    "contact": "Contact No.",
+}
+
+with tab4:
+    st.header("🪪 Update KYC Documents → Google Sheet")
+    st.markdown(
+        "Upload Aadhaar / PAN / Passport for the applicant (and optionally a co-applicant), "
+        "enter the Unit No., and the extracted details will be written into the matching row "
+        "of your Google Sheet. **Nothing is written until you review and click Save.**"
+    )
+
+    id_default_sheet_id = os.environ.get("DEFAULT_SHEET_ID", "")
+    id_col1, id_col2, id_col3 = st.columns(3)
+    with id_col1:
+        id_unit_no = st.text_input("Unit No.", key="id_unit_no")
+    with id_col2:
+        id_sheet_id = st.text_input("Google Sheet ID", value=id_default_sheet_id, key="id_sheet_id")
+    with id_col3:
+        id_tab_name = st.text_input("Sheet Tab Name", value="Inventory Sheet", key="id_tab_name")
+
+    st.subheader("Primary Applicant")
+    p_col1, p_col2, p_col3 = st.columns(3)
+    with p_col1:
+        id_p_aadhaar = st.file_uploader("Aadhaar Card", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_p_aadhaar")
+    with p_col2:
+        id_p_pan = st.file_uploader("PAN Card", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_p_pan")
+    with p_col3:
+        id_p_passport = st.file_uploader("Passport", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_p_passport")
+
+    st.subheader("Co-Applicant (optional)")
+    c_col1, c_col2, c_col3 = st.columns(3)
+    with c_col1:
+        id_c_aadhaar = st.file_uploader("Aadhaar Card", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_c_aadhaar")
+    with c_col2:
+        id_c_pan = st.file_uploader("PAN Card", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_c_pan")
+    with c_col3:
+        id_c_passport = st.file_uploader("Passport", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="id_c_passport")
+
+    def _to_doc_list(files):
+        return [{"bytes": f.getvalue(), "mime": f.type, "filename": f.name} for f in (files or [])]
+
+    if st.button("🔍 Extract Details", key="id_extract_btn"):
+        has_primary_docs = bool(id_p_aadhaar or id_p_pan or id_p_passport)
+        if not has_primary_docs:
+            st.warning("⚠️ Upload at least one document for the primary applicant.")
+        else:
+            with st.spinner("🤖 Extracting identity fields..."):
+                try:
+                    primary_extracted = extract_id_documents(
+                        _to_doc_list(id_p_aadhaar), _to_doc_list(id_p_pan), _to_doc_list(id_p_passport),
+                    )
+                    st.session_state["id_update_primary"] = primary_extracted
+
+                    has_co_docs = bool(id_c_aadhaar or id_c_pan or id_c_passport)
+                    if has_co_docs:
+                        co_extracted = extract_id_documents(
+                            _to_doc_list(id_c_aadhaar), _to_doc_list(id_c_pan), _to_doc_list(id_c_passport),
+                        )
+                        st.session_state["id_update_co"] = co_extracted
+                    else:
+                        st.session_state["id_update_co"] = {}
+                    st.toast("✅ Extraction complete — review below before saving.")
+                except Exception as e:
+                    st.error(f"❌ Extraction failed: {e}")
+
+    if "id_update_primary" in st.session_state:
+        st.markdown("---")
+        st.subheader("Review & Edit Extracted Values")
+        st.caption("Edit any field below if the extraction got something wrong. Blank fields are left untouched in the sheet.")
+
+        st.markdown("**Primary Applicant**")
+        primary_edited = {}
+        for key, label in ID_FIELD_LABELS.items():
+            primary_edited[key] = st.text_input(
+                f"{label} (Primary)",
+                value=st.session_state["id_update_primary"].get(key, ""),
+                key=f"id_edit_primary_{key}",
+            )
+
+        co_edited = {}
+        if st.session_state.get("id_update_co"):
+            st.markdown("**Co-Applicant**")
+            for key, label in ID_FIELD_LABELS.items():
+                if key not in CO_APPLICANT_FIELD_MAP:
+                    continue
+                co_edited[key] = st.text_input(
+                    f"{label} (Co-Applicant)",
+                    value=st.session_state["id_update_co"].get(key, ""),
+                    key=f"id_edit_co_{key}",
+                )
+
+        if st.button("💾 Save to Sheet", type="primary", key="id_save_btn"):
+            if not id_unit_no.strip():
+                st.warning("⚠️ Please enter the Unit No.")
+            elif not id_sheet_id.strip():
+                st.warning("⚠️ Please enter a Google Sheet ID.")
+            elif not id_tab_name.strip():
+                st.warning("⚠️ Please enter the sheet tab name.")
+            else:
+                field_values = {}
+                for key, value in primary_edited.items():
+                    col = PRIMARY_APPLICANT_FIELD_MAP.get(key)
+                    if col and value.strip():
+                        field_values[col] = value.strip()
+                for key, value in co_edited.items():
+                    col = CO_APPLICANT_FIELD_MAP.get(key)
+                    if col and value.strip():
+                        field_values[col] = value.strip()
+
+                if not field_values:
+                    st.warning("⚠️ No non-empty fields to write.")
+                else:
+                    try:
+                        result = update_unit_row(
+                            sheet_id=id_sheet_id.strip(),
+                            tab=id_tab_name.strip(),
+                            unit_no=id_unit_no.strip(),
+                            field_values=field_values,
+                        )
+                        st.success(
+                            f"✅ Updated row {result['row']} — columns: {', '.join(result['updated_columns'])}"
+                        )
+                        try:
+                            append_kyc_log(
+                                buyer_name=primary_edited.get("name", "Unknown"),
+                                project_name=id_tab_name.strip(),
+                                unit_number=id_unit_no.strip(),
+                                status="SHEET_UPDATED",
+                                report_text=f"Updated columns: {', '.join(result['updated_columns'])}",
+                            )
+                        except Exception as log_err:
+                            st.warning(f"⚠️ Could not write audit log: {log_err}")
+                    except Exception as e:
+                        st.error(f"❌ Save failed: {e}")

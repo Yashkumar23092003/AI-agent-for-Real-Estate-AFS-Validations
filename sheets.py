@@ -209,3 +209,116 @@ def append_afs_log(unit_no, buyer_name, project_name, sheet_id, tab_name,
     row = [_now(), unit_no, buyer_name, project_name, sheet_id, tab_name,
            afs_filename, verdict] + field_cells
     ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+# ── ID document update (write extracted Aadhaar/PAN/Passport into a Unit row) ──
+# Additive only — does not touch any function above. Maps onto the *actual*
+# column headers found in the live "Inventory Sheet" / "4QT Details" tabs.
+# Columns that don't exist yet (e.g. Passport, co-applicant PAN/Aadhaar) are
+# auto-created at the end of the header row on first write.
+
+PRIMARY_APPLICANT_FIELD_MAP = {
+    "name": "Applicants Name",
+    "pan": "Applicant's Pan No.",
+    "aadhaar": "Applicant's Aadhar No.",
+    "email": "Email Id",
+    "address": "Address",
+    "contact": "Contact No.",
+    "passport": "Passport No.",
+}
+
+CO_APPLICANT_FIELD_MAP = {
+    "name": "Co- Applicant's Name",
+    "pan": "Co-Applicant's Pan No.",
+    "aadhaar": "Co-Applicant's Aadhar No.",
+    "email": "Co-Applicant's Email Id",
+    "passport": "Co-Applicant's Passport No.",
+}
+
+
+def find_unit_row_index(ws: gspread.Worksheet, unit_no: str) -> tuple:
+    """
+    Like find_unit_row(), but returns (row_num, raw_headers) instead of a
+    value dict — needed so callers can write back to the same row.
+
+    Reuses the identical 'Unit No.' column-detection and uniqueness rules as
+    find_unit_row() so write-path matching never diverges from the read-path.
+    Raises ValueError on the same conditions find_unit_row() does.
+    """
+    all_values = ws.get_all_values()
+    if len(all_values) < 2:
+        raise ValueError(
+            "Sheet has fewer than 2 rows — expected at least a header row and one data row."
+        )
+
+    raw_headers = all_values[0]
+    norm_headers = [normalize_header(h) for h in raw_headers]
+
+    unit_no_indices = [i for i, h in enumerate(norm_headers) if h == "unit no."]
+    if not unit_no_indices:
+        raise ValueError(
+            "No 'Unit No.' column found in sheet. "
+            "Check that the header row contains 'Unit No.' exactly."
+        )
+
+    search_idx = unit_no_indices[0]
+    unit_no_str = str(unit_no).strip()
+
+    matching_rows = []
+    for row_num, row in enumerate(all_values[1:], start=2):
+        cell = row[search_idx].strip() if search_idx < len(row) else ""
+        if cell == unit_no_str:
+            matching_rows.append(row_num)
+
+    if not matching_rows:
+        raise ValueError(
+            f"Unit No. '{unit_no_str}' not found in sheet. "
+            "Ensure the unit number matches exactly (case-sensitive, no leading zeros)."
+        )
+    if len(matching_rows) > 1:
+        raise ValueError(
+            f"Unit No. '{unit_no_str}' found in multiple rows: {matching_rows}. "
+            "Sheet must contain unique unit numbers."
+        )
+
+    return matching_rows[0], raw_headers
+
+
+def update_unit_row(sheet_id: str, tab: str, unit_no: str, field_values: dict) -> dict:
+    """
+    Writes extracted ID-document fields into the row matching `unit_no`.
+
+    `field_values` is a flat {column_header: value} dict (use
+    PRIMARY_APPLICANT_FIELD_MAP / CO_APPLICANT_FIELD_MAP to build it from
+    extracted name/pan/aadhaar/... keys). Empty/None values are skipped —
+    fields the caller didn't extract are left untouched in the sheet.
+
+    If a column header doesn't exist yet, it is appended to the end of the
+    header row (row 1) before writing the value. Existing columns and rows
+    are never reordered or removed.
+
+    Returns {"row": <row_num>, "updated_columns": [...]}.
+    """
+    ws = get_worksheet(sheet_id, tab)
+    row_num, raw_headers = find_unit_row_index(ws, unit_no)
+
+    updated_columns = []
+    for header, value in field_values.items():
+        if value is None or str(value).strip() == "":
+            continue
+
+        col_idx = None
+        for i, h in enumerate(raw_headers):
+            if h == header:
+                col_idx = i
+                break
+
+        if col_idx is None:
+            col_idx = len(raw_headers)
+            raw_headers.append(header)
+            ws.update_cell(1, col_idx + 1, header)
+
+        ws.update_cell(row_num, col_idx + 1, value)
+        updated_columns.append(header)
+
+    return {"row": row_num, "updated_columns": updated_columns}

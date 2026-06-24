@@ -684,6 +684,99 @@ def verify_afs_against_sheet(
     }
 
 
+# ── ID document extraction (Aadhaar/PAN/Passport -> Sheet update) ──────────────
+# Additive only — does not call or modify verify_documents() or any function
+# above. Used by the "Update KYC -> Sheet" tab to extract identity fields for
+# writing into a Unit row via sheets.update_unit_row().
+
+ID_EXTRACTION_PROMPT = """
+You are an OCR/extraction assistant. You will be shown ID document images
+(Aadhaar card, PAN card, and/or Passport) for ONE applicant.
+
+Extract exactly these fields from the images provided. If a document type is
+not provided, or a field is not visible/legible, return an empty string "" for
+that field — do NOT guess or invent values.
+
+Return ONLY a single JSON object (no markdown fences, no commentary) with
+exactly these keys:
+{
+  "name": "",
+  "pan": "",
+  "aadhaar": "",
+  "passport": "",
+  "email": "",
+  "address": "",
+  "contact": ""
+}
+
+Rules:
+- "name": full name exactly as printed on whichever document shows it most clearly.
+- "pan": 10-character PAN, uppercase, only if a PAN card image was provided.
+- "aadhaar": 12-digit Aadhaar number, only if an Aadhaar card image was provided. If masked, return only the visible digits.
+- "passport": passport number, only if a passport image was provided.
+- "email" / "contact" / "address": only if visible on a provided document; most ID cards won't show these — leave blank rather than guessing.
+- Never fabricate a value for a field that isn't visible.
+"""
+
+
+def extract_id_documents(aadhaar_list: list, pan_list: list, passport_list: list | None = None) -> dict:
+    """
+    Sends Aadhaar/PAN/Passport images for ONE applicant to OpenAI vision and
+    returns a flat dict: {"name", "pan", "aadhaar", "passport", "email",
+    "address", "contact"}. Any field not extractable is "".
+
+    Raises ValueError if no documents are provided, or if OPENAI_API_KEY is
+    missing.
+    """
+    passport_list = passport_list or []
+    if not aadhaar_list and not pan_list and not passport_list:
+        raise ValueError("No documents provided — upload at least one of Aadhaar, PAN, or Passport.")
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set in the environment.")
+
+    client = OpenAI(api_key=api_key, timeout=120.0)
+
+    content_array = [{"type": "text", "text": "Extract the identity fields from these document images."}]
+    for item in aadhaar_list:
+        for b64 in get_base64_from_bytes(item["bytes"], item["mime"]):
+            content_array.append({"type": "image_url", "image_url": {"url": b64}})
+    for item in pan_list:
+        for b64 in get_base64_from_bytes(item["bytes"], item["mime"]):
+            content_array.append({"type": "image_url", "image_url": {"url": b64}})
+    for item in passport_list:
+        for b64 in get_base64_from_bytes(item["bytes"], item["mime"]):
+            content_array.append({"type": "image_url", "image_url": {"url": b64}})
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": ID_EXTRACTION_PROMPT},
+            {"role": "user", "content": content_array},
+        ],
+        temperature=0.0,
+        max_tokens=1024,
+        response_format={"type": "json_object"},
+    )
+
+    text_response = response.choices[0].message.content
+    try:
+        parsed = json.loads(text_response)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nResponse: {text_response[:500]}")
+
+    return {
+        "name": str(parsed.get("name", "") or "").strip(),
+        "pan": str(parsed.get("pan", "") or "").strip(),
+        "aadhaar": str(parsed.get("aadhaar", "") or "").strip(),
+        "passport": str(parsed.get("passport", "") or "").strip(),
+        "email": str(parsed.get("email", "") or "").strip(),
+        "address": str(parsed.get("address", "") or "").strip(),
+        "contact": str(parsed.get("contact", "") or "").strip(),
+    }
+
+
 # ── Unified verification (KYC + Sheet in one go) ───────────────────────────────
 
 def verify_unified(
