@@ -316,6 +316,8 @@ def update_unit_row(sheet_id: str, tab: str, unit_no: str, field_values: dict) -
         if col_idx is None:
             col_idx = len(raw_headers)
             raw_headers.append(header)
+            if col_idx + 1 > ws.col_count:
+                ws.add_cols(col_idx + 1 - ws.col_count)
             ws.update_cell(1, col_idx + 1, header)
 
         ws.update_cell(row_num, col_idx + 1, value)
