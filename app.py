@@ -324,7 +324,7 @@ with tab0:
         u_default_sheet_id = os.environ.get("DEFAULT_SHEET_ID", "1pdRt04-OgUvEQJLXqZXBtZJO2Cs7Yg4KwfmW7k7heYg")
         u_sheet_id_input = st.text_input("4. Google Sheet ID", value=u_default_sheet_id, key="u_sheet_id")
     with u_col_s2:
-        u_tab_name_input = st.text_input("5. Sheet Tab Name", value="Sheet1", key="u_tab_name")
+        u_tab_name_input = st.text_input("5. Sheet Tab Name", value="Inventory Sheet", key="u_tab_name")
 
     with st.expander("⚙️ Developer options"):
         u_use_fixture_cb = st.checkbox(
@@ -467,7 +467,7 @@ with tab2:
         default_sheet_id = os.environ.get("DEFAULT_SHEET_ID", "1pdRt04-OgUvEQJLXqZXBtZJO2Cs7Yg4KwfmW7k7heYg")
         sheet_id_input = st.text_input("2. Google Sheet ID", value=default_sheet_id)
     with col_s2:
-        tab_name_input = st.text_input("3. Sheet Tab Name", value="Sheet1")
+        tab_name_input = st.text_input("3. Sheet Tab Name", value="Inventory Sheet")
 
     with st.expander("⚙️ Developer options"):
         use_fixture_cb = st.checkbox(
